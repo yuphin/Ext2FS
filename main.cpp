@@ -88,7 +88,7 @@ struct Filesystem{
         auto block_no = (uint32_t)ceil(((float)BASE_OFFSET+ sizeof(sup))/ blksz);
         gdt = reinterpret_cast<ext2_group_desc*>(get_block(block_no));
         auto * root = get_inode(2);
-        auto *dir = reinterpret_cast<ext2_dir_entry*>(get_block(9)+44);
+        auto *dir = reinterpret_cast<ext2_dir_entry*>(get_block(27));
         auto *inode = get_inode(12);
         inode_bitmap_size =  inopgrp / 8;
         block_bitmap_size = blkpgrp / 8;
@@ -127,131 +127,202 @@ struct Filesystem{
 
 
 
-    void write_file(FILE *file,const std::string& file_name){
+    uint32_t write_file(const std::string& file_name,struct stat& sb,FILE* file = nullptr,uint32_t parent_inode=2){
         unsigned char buffer[1024];
-        struct stat sb{};
         size_t bytesRead = 0;
-        int fd = fileno(file);
         std::vector<uint32_t > blknums;
-        // Write to datablocks
-        while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0){
-            blknums.emplace_back(write_data_blk(bytesRead,buffer));
-        }
-        if(fstat(fd,&sb) == -1){
-            std::perror("fstat error");
-
-        }
         auto idx_free_inode = get_free_inode();
         auto*inode = get_inode(idx_free_inode);
-        // Write to inode
+
+
+        // Write to inode //
         // File related stuff
         inode->i_mode = sb.st_mode;
         inode->i_uid = sb.st_uid & 0xFFFF;
         inode->i_gid = sb.st_gid & 0xFFFF;
-        inode->i_size = sb.st_size;
-        inode->i_blocks = sb.st_blocks;
+
         inode->i_atime = sb.st_atim.tv_sec;
         inode->i_mtime = sb.st_mtim.tv_sec;
         inode->i_ctime = sb.st_ctim.tv_sec;
-        // Misc. for inode
-        inode->i_links_count = 1;
         inode->i_flags = 1;
-        unsigned int blk_size = blknums.size();
-        unsigned int cnt = std::min(blk_size,12u);
-        for(int i =0; i < cnt;i++){
-            inode->i_block[i] = blknums[i];
-        }
-        unsigned int pointers_per_block = blksz / 4;
-        // Indirect block
-        if(blk_size > 12 ){
-            blk_size -= 12;
-            cnt = std::min(blk_size,pointers_per_block);
-            auto ind_block = get_free_block();
-            auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
-            inode->i_block[12] = ind_block;
-            for(int i =0; i < cnt;i++){
-                block[i] = blknums[12+i];
+
+
+        // Misc. for inode
+        if(S_ISREG(sb.st_mode)){
+            inode->i_links_count = 1;
+            inode->i_size = sb.st_size;
+            inode->i_blocks = sb.st_blocks;
+            // Write to datablocks
+            while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0){
+                blknums.emplace_back(write_data_blk(bytesRead,buffer));
             }
-        }
-        // Double Indirect Block
-        if(blk_size > pointers_per_block){
-            blk_size -= pointers_per_block;
-            cnt = std::min(blk_size,pointers_per_block*pointers_per_block);
-            auto d_ind_block = get_free_block();
-            auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
-            inode->i_block[13] = d_ind_block;
-            for(int i = 0; i < pointers_per_block;i++){
+            unsigned int blk_size = blknums.size();
+            unsigned int cnt = std::min(blk_size,12u);
+            for(int i =0; i < cnt;i++){
+                inode->i_block[i] = blknums[i];
+            }
+            unsigned int pointers_per_block = blksz / 4;
+            // Indirect block
+            if(blk_size > 12 ){
+                blk_size -= 12;
+                cnt = std::min(blk_size,pointers_per_block);
                 auto ind_block = get_free_block();
                 auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
-                dblock[i] = ind_block;
-                for(int j=0; j < pointers_per_block;j++ ){
-                    block[j] = blknums[12 + pointers_per_block + j];
-                    cnt--;
-                    if(!cnt){
-                        goto triple;
-                    }
+                inode->i_block[12] = ind_block;
+                for(int i =0; i < cnt;i++){
+                    block[i] = blknums[12+i];
                 }
             }
-
-
-
-        }
-        triple:
-        if(blk_size >  pointers_per_block*pointers_per_block){
-            // Triple Indirect BLock
-            blk_size -= pointers_per_block*pointers_per_block;
-            cnt = std::min(blk_size,pointers_per_block*pointers_per_block*pointers_per_block);
-            auto t_ind_block = get_free_block();
-            auto * tblock = reinterpret_cast<uint32_t *>(get_block(t_ind_block));
-            inode->i_block[14] = t_ind_block;
-            for(int i=0; i< pointers_per_block; i++){
+            // Double Indirect Block
+            if(blk_size > pointers_per_block){
+                blk_size -= pointers_per_block;
+                cnt = std::min(blk_size,pointers_per_block*pointers_per_block);
                 auto d_ind_block = get_free_block();
                 auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
-                tblock[i] = d_ind_block;
-                for(int j=0; j < pointers_per_block; j++){
+                inode->i_block[13] = d_ind_block;
+                for(int i = 0; i < pointers_per_block;i++){
                     auto ind_block = get_free_block();
                     auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
-                    dblock[j] = ind_block;
-                    for(int k = 0; k < pointers_per_block; k++){
-                        block[k] = blknums[12 + pointers_per_block*pointers_per_block + k];
+                    dblock[i] = ind_block;
+                    for(int j=0; j < pointers_per_block;j++ ){
+                        block[j] = blknums[12 + pointers_per_block + j];
                         cnt--;
                         if(!cnt){
-                            goto directory;
+                            goto triple;
                         }
                     }
                 }
+
+
+
+            }
+            triple:
+            if(blk_size >  pointers_per_block*pointers_per_block){
+                // Triple Indirect BLock
+                blk_size -= pointers_per_block*pointers_per_block;
+                cnt = std::min(blk_size,pointers_per_block*pointers_per_block*pointers_per_block);
+                auto t_ind_block = get_free_block();
+                auto * tblock = reinterpret_cast<uint32_t *>(get_block(t_ind_block));
+                inode->i_block[14] = t_ind_block;
+                for(int i=0; i< pointers_per_block; i++){
+                    auto d_ind_block = get_free_block();
+                    auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
+                    tblock[i] = d_ind_block;
+                    for(int j=0; j < pointers_per_block; j++){
+                        auto ind_block = get_free_block();
+                        auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
+                        dblock[j] = ind_block;
+                        for(int k = 0; k < pointers_per_block; k++){
+                            block[k] = blknums[12 + pointers_per_block*pointers_per_block + k];
+                            cnt--;
+                            if(!cnt){
+                                goto directory;
+                            }
+                        }
+                    }
+                }
+
+            }
+            // Write to directory entries
+            directory:
+            auto * root = get_inode(parent_inode);
+            for(int i= 0; i < 12; i++){
+                unsigned int blk_num = root->i_block[i];
+                if(blk_num ==0){
+                    blk_num = get_free_block();
+                    root->i_blocks +=  (blksz / 512);
+                    root->i_size += blksz;
+                    root->i_block[i] = blk_num;
+                }
+                unsigned int pad = (4-  (file_name.length() % 4)) % 4;
+                unsigned int required_bytes = 4 + file_name.length() + pad;
+                auto  dir =  get_free_dir_entry(blk_num,required_bytes);
+                auto* dir_entry = reinterpret_cast<ext2_dir_entry*>(std::get<0>(dir));
+                if(!dir_entry){
+                    continue;
+                }
+                uint32_t rec_len = std::get<1>(dir);
+                dir_entry->inode = idx_free_inode;
+                dir_entry->rec_len = rec_len;
+                dir_entry->name_len = file_name.length();
+                dir_entry->file_type = EXT2_FT_REG_FILE;
+                std::memcpy(dir_entry->name,file_name.c_str(), dir_entry->name_len);
+                fclose(file);
+                return 0;
             }
 
+        }else if(S_ISDIR(sb.st_mode)){
+            auto * parent = get_inode(parent_inode);
+            inode->i_links_count = 2;
+            inode->i_size =0;
+            inode->i_blocks = 0;
+
+            parent->i_links_count ++;
+            for(int i= 0; i < 12; i++){
+                unsigned int blk_num_parent= parent->i_block[i];
+                if(blk_num_parent == 0){
+                    blk_num_parent = get_free_block();
+                    parent->i_blocks +=  (blksz / 512);
+                    parent->i_size += blksz;
+                    parent->i_block[i] = blk_num_parent;
+                }
+                unsigned int pad = (4-  (file_name.length() % 4)) % 4;
+                unsigned int required_bytes = 4 + file_name.length() + pad;
+                auto dir_parent = get_free_dir_entry(blk_num_parent,required_bytes);
+                auto* dir_entry_parent =reinterpret_cast<ext2_dir_entry*>(std::get<0>(dir_parent));
+                if(!dir_entry_parent){
+                    continue;
+                }
+
+                uint32_t rec_len_parent = std::get<1>(dir_parent);
+                dir_entry_parent->inode = idx_free_inode;
+                dir_entry_parent->rec_len = rec_len_parent;
+                dir_entry_parent->name_len = file_name.length();
+                dir_entry_parent->file_type = EXT2_FT_DIR;
+                std::memcpy(dir_entry_parent->name,file_name.c_str(), dir_entry_parent->name_len);
+                break;
+            }
+
+            for(int i= 0; i < 12; i++){
+                unsigned int blk_num = inode->i_block[i];
+                if(blk_num ==0){
+                    blk_num = get_free_block();
+                    inode->i_blocks +=  (blksz / 512);
+                    inode->i_size += blksz;
+                    inode->i_block[i] = blk_num;
+                }
+
+                unsigned int required_bytes = 12;
+                auto  dir1 =  get_free_dir_entry(blk_num,required_bytes);
+                auto* dir_entry1 = reinterpret_cast<ext2_dir_entry*>(std::get<0>(dir1));
+                if(!dir_entry1){
+                    continue;
+                }
+                uint32_t rec_len1 = std::get<1>(dir1);
+                dir_entry1->inode = idx_free_inode;
+                dir_entry1->rec_len = rec_len1;
+                dir_entry1->name_len = 1;
+                dir_entry1->file_type = EXT2_FT_DIR;
+                dir_entry1->name[0] = '.';
+
+
+                auto  dir2 =  get_free_dir_entry(blk_num,required_bytes);
+                auto* dir_entry2 = reinterpret_cast<ext2_dir_entry*>(std::get<0>(dir2));
+                uint32_t rec_len2 = std::get<1>(dir2);
+                dir_entry2->inode = parent_inode;
+                dir_entry2->rec_len = rec_len2;
+                dir_entry2->name_len = 2;
+                dir_entry2->file_type = EXT2_FT_DIR;
+                dir_entry2->name[0] = '.';
+                dir_entry2->name[1] = '.';
+
+
+
+                return idx_free_inode;
+            }
         }
 
-        // Write to directory entries
-        directory:
-        auto * root = get_inode(2);
-        for(int i= 0; i < 12; i++){
-            unsigned int blk_num = root->i_block[i];
-            if(blk_num ==0){
-                blk_num = get_free_block();
-                root->i_blocks +=  (blksz / 512);
-                root->i_size += blksz;
-                root->i_block[i] = blk_num;
-            }
-            unsigned int pad = (4-  (file_name.length() % 4)) % 4;
-            unsigned int required_bytes = 4 + file_name.length() + pad;
-            auto  dir =  get_free_dir_entry(blk_num,required_bytes);
-            auto* dir_entry = reinterpret_cast<ext2_dir_entry*>(std::get<0>(dir));
-            if(!dir_entry){
-                continue;
-            }
-            uint32_t rec_len = std::get<1>(dir);
-            dir_entry->inode = idx_free_inode;
-            dir_entry->rec_len = rec_len;
-            dir_entry->name_len = file_name.length();
 
-            //Change this later
-            dir_entry->file_type = EXT2_FT_REG_FILE;
-            std::memcpy(dir_entry->name,file_name.c_str(), dir_entry->name_len);
-            return;
-        }
 
 
 
@@ -263,8 +334,11 @@ struct Filesystem{
         auto  * dir = reinterpret_cast<ext2_dir_entry*>(dir_offset);
         unsigned int pad =  (4-  (dir->name_len % 4)) % 4;
         unsigned int cur_req = 8 + dir->name_len + pad;
-        unsigned int read_bytes = 0;
+        unsigned int read_bytes = dir->rec_len;
         while(dir ->rec_len < required_bytes + cur_req && dir->inode){
+            if(dir->rec_len == 328){
+                int b = 4;
+            }
             if(read_bytes >= blksz){
                 return std::make_tuple(nullptr,0);
             }
@@ -279,6 +353,9 @@ struct Filesystem{
             return std::make_tuple(dir_offset,blksz);
         }else{
             auto tup = std::make_tuple(dir_offset + cur_req,dir->rec_len  - cur_req);
+            if(dir->rec_len  - cur_req == 232){
+                int a = 4;
+            }
             dir->rec_len = cur_req;
             return tup;
         }
@@ -324,11 +401,16 @@ struct Filesystem{
 
     }
 
+    unsigned int create_directory(unsigned int root,const std::string& dir_name){
+
+
+    }
+
 
 };
 
-bool isDir(const std::string& dir){
-    struct stat fileInfo;
+bool isDir(const std::string& dir,struct stat& fileInfo){
+
     stat(dir.c_str(), &fileInfo);
     if (S_ISDIR(fileInfo.st_mode)){
         return true;
@@ -337,7 +419,7 @@ bool isDir(const std::string& dir){
     }
 }
 
-void getdir(std::string dir, std::vector<std::tuple<std::string,std::string>> &files, bool recursive,const std::string& parent){
+void getdir(std::string dir, uint32_t parent,Filesystem fs){
     DIR *dp; //create the directory object
     struct dirent *entry; //create the entry structure
     dp=opendir(dir.c_str()); //open directory by converting the string to const char*
@@ -348,15 +430,15 @@ void getdir(std::string dir, std::vector<std::tuple<std::string,std::string>> &f
         entry=readdir(dp);
         while(entry){ //while there is something in the directory
             if(strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0){ //and if the entry isn't "." or ".."
-                if (isDir(dir + entry->d_name)) {
-                    if (recursive) {//check if the new path is a directory, and if it is (and recursion is specified as true), recurse.
-                        files.emplace_back(std::make_tuple(entry->d_name,dir)); //add entry to the list of files
-                        getdir(dir + entry->d_name, files, true,dir); //recurse
-                    } else {
-                        files.emplace_back(std::make_tuple(entry->d_name,parent));//add the entry to the list of files
-                    }
+                struct stat fileInfo{};
+                if (isDir(dir + entry->d_name,fileInfo)) {
+                        uint32_t inode = fs.write_file(entry->d_name,fileInfo,nullptr,parent);
+                        getdir(dir + entry->d_name, inode,fs); //recurse
                 } else {
-                    files.emplace_back(std::make_tuple(entry->d_name,dir));
+                    FILE *file = fopen((dir + entry->d_name).c_str(),"r");
+
+                    fs.write_file(entry->d_name,fileInfo,file,parent);
+                    std::cout << "Read " << entry->d_name << std::endl;
                 }
             }
             entry=readdir(dp);
@@ -369,17 +451,8 @@ void getdir(std::string dir, std::vector<std::tuple<std::string,std::string>> &f
 }
 
 int main(int argc,char *argv[]) {
-    /*
     auto * img = load_image(argv[1]);
     auto fs = Filesystem(img);
-    FILE *file = nullptr;
-    file = fopen("loremloremloremloremloremloremloremloremloremloremloremloremloremloremloremlorem12.txt","r");
-    fs.write_file(file,"loremloremloremloremloremloremloremloremloremloremloremloremloremloremloremlorem12.txt");
-    fclose(file);
-     */
-    std::vector<std::tuple<std::string,std::string>> files{};
-    getdir("./test",files,true,"none");
-    int a = 4;
-
+    getdir("test2",2,fs);
     return 0;
 }
