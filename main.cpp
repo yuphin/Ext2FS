@@ -1,3 +1,5 @@
+
+
 #include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +16,8 @@
 #include <bitset>
 #include <tuple>
 #include <dirent.h>
-
+#include <queue>
+#include <unordered_map>
 #define BASE_OFFSET 1024
 #define PROT_WR (uint32_t)PROT_READ|(uint32_t)PROT_WRITE
 
@@ -103,7 +106,6 @@ struct Filesystem{
     }
 
     uint32_t find_inode(uint32_t inode,const std::string& dir_name){
-
 
         auto *dir_inode = get_inode(inode);
         for(int i=0; i < 12 ; i++){
@@ -200,7 +202,8 @@ struct Filesystem{
         if(S_ISREG(sb.st_mode)){
             inode->i_links_count = 1;
             inode->i_size =  sb.st_size;
-            inode->i_blocks = sb.st_blocks;
+            inode->i_blocks = 0;
+            std::vector<unsigned int> blocks;
             // Write to datablocks
             while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0){
                 blknums.emplace_back(write_data_blk(bytesRead,buffer));
@@ -209,6 +212,8 @@ struct Filesystem{
             unsigned int cnt = std::min(blk_size,12u);
             for(int i =0; i < cnt;i++){
                 inode->i_block[i] = blknums[i];
+                inode->i_blocks += (blksz / 512);
+                blocks.emplace_back(blknums[i]);
             }
             unsigned int pointers_per_block = blksz / 4;
             // Indirect block
@@ -217,10 +222,13 @@ struct Filesystem{
                 blk_size -= 12;
                 cnt = std::min(blk_size,pointers_per_block);
                 auto ind_block = get_free_block();
+                blocks.emplace_back(ind_block);
                 auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
                 inode->i_block[12] = ind_block;
                 for(int i =0; i < cnt;i++){
+                    inode->i_blocks += (blksz / 512);
                     block[i] = blknums[12+i];
+                    blocks.emplace_back(blknums[12+i]);
                 }
             }
             // Double Indirect Block
@@ -229,14 +237,19 @@ struct Filesystem{
                 inode->i_blocks += (blksz / 512);
                 cnt = std::min(blk_size,pointers_per_block*pointers_per_block);
                 auto d_ind_block = get_free_block();
+                blocks.emplace_back(d_ind_block);
                 auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
                 inode->i_block[13] = d_ind_block;
                 for(int i = 0; i < pointers_per_block;i++){
                     auto ind_block = get_free_block();
                     auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
+                    blocks.emplace_back(ind_block);
+                    inode->i_blocks += (blksz / 512);
                     dblock[i] = ind_block;
                     for(int j=0; j < pointers_per_block;j++ ){
                         block[j] = blknums[12 + pointers_per_block + j];
+                        blocks.emplace_back(blknums[12 + pointers_per_block + j]);
+                        inode->i_blocks += (blksz / 512);
                         cnt--;
                         if(!cnt){
                             goto triple;
@@ -254,18 +267,25 @@ struct Filesystem{
                 inode->i_blocks += (blksz / 512);
                 cnt = std::min(blk_size,pointers_per_block*pointers_per_block*pointers_per_block);
                 auto t_ind_block = get_free_block();
+                blocks.emplace_back(t_ind_block);
                 auto * tblock = reinterpret_cast<uint32_t *>(get_block(t_ind_block));
                 inode->i_block[14] = t_ind_block;
                 for(int i=0; i< pointers_per_block; i++){
                     auto d_ind_block = get_free_block();
                     auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
+                    blocks.emplace_back(d_ind_block);
+                    inode->i_blocks += (blksz / 512);
                     tblock[i] = d_ind_block;
                     for(int j=0; j < pointers_per_block; j++){
                         auto ind_block = get_free_block();
                         auto * block = reinterpret_cast<uint32_t *>(get_block(ind_block));
+                        blocks.emplace_back(ind_block);
+                        inode->i_blocks += (blksz / 512);
                         dblock[j] = ind_block;
                         for(int k = 0; k < pointers_per_block; k++){
                             block[k] = blknums[12 + pointers_per_block*pointers_per_block + k];
+                            blocks.emplace_back(blknums[12 + pointers_per_block*pointers_per_block + k]);
+                            inode->i_blocks += (blksz / 512);
                             cnt--;
                             if(!cnt){
                                 goto directory;
@@ -300,6 +320,15 @@ struct Filesystem{
                 dir_entry->file_type = EXT2_FT_REG_FILE;
                 std::memcpy(dir_entry->name,file_name.c_str(), dir_entry->name_len);
                 fclose(file);
+                std::cout << idx_free_inode << " ";
+                for(int idx=0; idx< blocks.size();idx++){
+                    if(idx != blocks.size()-1){
+                        std::cout << blocks[idx] << " ";
+                    }else{
+                        std::cout << blocks[idx] << std::endl;
+                    }
+
+                }
                 return 0;
             }
 
@@ -472,7 +501,15 @@ bool isDir(const std::string& dir,struct stat& fileInfo){
     }
 }
 
-void getdir(std::string dir, uint32_t parent,Filesystem fs){
+
+std::unordered_map<int,uint32_t > umap;
+std::unordered_map<std::string,std::string> fmap;
+int incr = -1;
+void getdir(std::string dir, uint32_t parent,Filesystem& fs,
+            std::priority_queue<
+                    std::tuple<std::string,unsigned int>,
+                    std::vector<std::tuple<std::string,unsigned int>>,
+                    std::greater<>>& queue){
     DIR *dp; //create the directory object
     struct dirent *entry; //create the entry structure
     dp=opendir(dir.c_str()); //open directory by converting the string to const char*
@@ -485,13 +522,22 @@ void getdir(std::string dir, uint32_t parent,Filesystem fs){
             if(strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0){ //and if the entry isn't "." or ".."
                 struct stat fileInfo{};
                 if (isDir(dir + entry->d_name,fileInfo)) {
-                        uint32_t inode = fs.write_file(entry->d_name,fileInfo,nullptr,parent);
-                        getdir(dir + entry->d_name, inode,fs); //recurse
-                } else {
-                    FILE *file = fopen((dir + entry->d_name).c_str(),"r");
 
-                    fs.write_file(entry->d_name,fileInfo,file,parent);
-                    std::cout << "Read " << entry->d_name << std::endl;
+                    //uint32_t inode = fs.write_file(entry->d_name,fileInfo,nullptr,parent);
+                    incr--;
+                    if(incr == parent)
+                        incr--;
+                    queue.push(std::make_tuple(dir + entry->d_name,incr));
+                    umap.insert(std::make_pair(incr,parent));
+                    fmap.insert(std::make_pair(dir + entry->d_name,entry->d_name));
+                    getdir(dir + entry->d_name,incr,fs,queue); //recurse
+
+                } else {
+                    queue.push(std::make_tuple(dir + entry->d_name,parent));
+                    fmap.insert(std::make_pair(dir + entry->d_name,entry->d_name));
+                    //FILE *file = fopen((dir + entry->d_name).c_str(),"r");
+                    //fs.write_file(entry->d_name,fileInfo,file,parent);
+                    //std::cout << "Read " << entry->d_name << std::endl;
                 }
             }
             entry=readdir(dp);
@@ -502,11 +548,42 @@ void getdir(std::string dir, uint32_t parent,Filesystem fs){
         perror ("Couldn't open the directory.");
     }
 }
+template<typename T> void process_queue(T &q,Filesystem&fs) {
+    while(!q.empty()) {
+        auto a = q.top();
+        struct stat fileInfo{};
+        FILE *file = fopen((std::get<0>(a)).c_str(),"r");
+        if(isDir(std::get<0>(a),fileInfo)){
+            auto inode = fs.write_file(fmap[std::get<0>(a)],fileInfo,nullptr,umap[std::get<1>(a)]);
+            //std::cout << std::get<0>(a) << " " << inode << "\n";
+            umap[std::get<1>(a)] = inode;
+        }else{
+            if(umap.find(std::get<1>(a)) != umap.end()){
+                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,umap[std::get<1>(a)]);
+                //std::cout << std::get<0>(a) << " " << umap[std::get<1>(a)] << "\n";
+            }else{
+                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,std::get<1>(a));
+                //std::cout << std::get<0>(a) << " " << std::get<1>(a) << "\n";
+            }
 
+        }
+        //fs.write_file(std::get<0>(a),fileInfo,file,std::get<1>(a));
+
+        q.pop();
+    }
+    std::cout << '\n';
+}
 int main(int argc,char *argv[]) {
+    uint32_t inode;
     auto * img = load_image(argv[1]);
     auto fs = Filesystem(img);
-    auto inode_num = fs.get_dir_inode(argv[2]);
-    getdir("lorems",inode_num,fs);
+    try{
+        inode = std::stoi(argv[3]);
+    }catch(const std::invalid_argument& ia){
+        inode = fs.get_dir_inode(argv[3]);
+    }
+    std::priority_queue <std::tuple<std::string,unsigned int>,std::vector<std::tuple<std::string,unsigned int>>,std::greater<>> q;
+    getdir(argv[2],inode,fs,q);
+    process_queue(q,fs);
     return 0;
 }
