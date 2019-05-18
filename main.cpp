@@ -77,7 +77,7 @@ struct Filesystem{
 
     explicit Filesystem(char* img){
         this->img = img;
-        sup = reinterpret_cast<ext2_super_block*>(get_block(1));
+        sup = reinterpret_cast<ext2_super_block*>(get_super_block());
         blksz = static_cast<unsigned int>(pow(2,10+sup->s_log_block_size));
         ninode = sup->s_inodes_count;
         nblk = sup->s_blocks_count;
@@ -88,14 +88,63 @@ struct Filesystem{
         auto block_no = (uint32_t)ceil(((float)BASE_OFFSET+ sizeof(sup))/ blksz);
         gdt = reinterpret_cast<ext2_group_desc*>(get_block(block_no));
         auto * root = get_inode(2);
-        auto *dir = reinterpret_cast<ext2_dir_entry*>(get_block(27));
-        auto *inode = get_inode(12);
+        auto *dir = reinterpret_cast<ext2_dir_entry*>(get_block(569));
+        auto *inode = get_inode(366);
         inode_bitmap_size =  inopgrp / 8;
         block_bitmap_size = blkpgrp / 8;
     }
 
     char* get_block(unsigned int block_id){
-        return  img + BASE_OFFSET + (block_id-1) * this->blksz;
+        return  img + block_id * this->blksz;
+    }
+
+    char* get_super_block(){
+        return img + BASE_OFFSET;
+    }
+
+    uint32_t find_inode(uint32_t inode,const std::string& dir_name){
+
+
+        auto *dir_inode = get_inode(inode);
+        for(int i=0; i < 12 ; i++){
+            auto *dir_offset = get_block(dir_inode->i_block[i]);
+            auto  * dir = reinterpret_cast<ext2_dir_entry*>(dir_offset);
+            unsigned int read_bytes = dir->rec_len;
+            while(read_bytes < blksz){
+                auto str = std::string(dir->name,dir->name_len);
+                if(str == dir_name){
+                    return dir->inode;
+                }
+                read_bytes += dir->rec_len;
+                dir_offset += dir->rec_len;
+                dir = reinterpret_cast<ext2_dir_entry*>(dir_offset);
+            }
+
+        }
+        return 0;
+
+
+
+    }
+
+    uint32_t get_dir_inode(std::basic_string<char> path){
+        if(path[0] == '/'){
+            path.erase(path.begin());
+        }
+        if(path[path.length()-1] != '/'){
+            path += "/";
+        }
+        std::string delimiter = "/";
+        size_t pos = 0;
+        std::string token;
+        uint32_t inode = 2;
+        while ((pos = path.find(delimiter)) != std::string::npos) {
+            token = path.substr(0, pos);
+            inode = find_inode(inode,token);
+            path.erase(0, pos + delimiter.length());
+        }
+
+        return inode;
     }
 
 
@@ -128,7 +177,7 @@ struct Filesystem{
 
 
     uint32_t write_file(const std::string& file_name,struct stat& sb,FILE* file = nullptr,uint32_t parent_inode=2){
-        unsigned char buffer[1024];
+        unsigned char buffer[blksz];
         size_t bytesRead = 0;
         std::vector<uint32_t > blknums;
         auto idx_free_inode = get_free_inode();
@@ -150,7 +199,7 @@ struct Filesystem{
         // Misc. for inode
         if(S_ISREG(sb.st_mode)){
             inode->i_links_count = 1;
-            inode->i_size = sb.st_size;
+            inode->i_size =  sb.st_size;
             inode->i_blocks = sb.st_blocks;
             // Write to datablocks
             while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0){
@@ -164,6 +213,7 @@ struct Filesystem{
             unsigned int pointers_per_block = blksz / 4;
             // Indirect block
             if(blk_size > 12 ){
+                inode->i_blocks += (blksz / 512);
                 blk_size -= 12;
                 cnt = std::min(blk_size,pointers_per_block);
                 auto ind_block = get_free_block();
@@ -176,6 +226,7 @@ struct Filesystem{
             // Double Indirect Block
             if(blk_size > pointers_per_block){
                 blk_size -= pointers_per_block;
+                inode->i_blocks += (blksz / 512);
                 cnt = std::min(blk_size,pointers_per_block*pointers_per_block);
                 auto d_ind_block = get_free_block();
                 auto * dblock = reinterpret_cast<uint32_t *>(get_block(d_ind_block));
@@ -200,6 +251,7 @@ struct Filesystem{
             if(blk_size >  pointers_per_block*pointers_per_block){
                 // Triple Indirect BLock
                 blk_size -= pointers_per_block*pointers_per_block;
+                inode->i_blocks += (blksz / 512);
                 cnt = std::min(blk_size,pointers_per_block*pointers_per_block*pointers_per_block);
                 auto t_ind_block = get_free_block();
                 auto * tblock = reinterpret_cast<uint32_t *>(get_block(t_ind_block));
@@ -253,10 +305,10 @@ struct Filesystem{
 
         }else if(S_ISDIR(sb.st_mode)){
             auto * parent = get_inode(parent_inode);
+
             inode->i_links_count = 2;
             inode->i_size =0;
             inode->i_blocks = 0;
-
             parent->i_links_count ++;
             for(int i= 0; i < 12; i++){
                 unsigned int blk_num_parent= parent->i_block[i];
@@ -317,7 +369,7 @@ struct Filesystem{
                 dir_entry2->name[1] = '.';
 
 
-
+                gdt[idx_free_inode / inopgrp].bg_used_dirs_count++;
                 return idx_free_inode;
             }
         }
@@ -363,12 +415,14 @@ struct Filesystem{
 
     }
     uint32_t get_free_block(){
-        uint32_t idx = 1;
+        uint32_t idx = sup->s_first_data_block;
         for(int i=0; i < ngroups; ++i){
             auto bat = get_bat(i);
             for(int j=0; j < blkpgrp;j++){
                 if(!bat.is_set(j)){
                     bat.set(j);
+                    gdt[i].bg_free_blocks_count--;
+                    sup->s_free_blocks_count --;
                     return idx;
                 }
                 idx++;
@@ -384,6 +438,8 @@ struct Filesystem{
             for(int j=0; j < inopgrp;j++){
                 if(!iat.is_set(j)){
                     iat.set(j);
+                    gdt[i].bg_free_inodes_count--;
+                    sup->s_free_inodes_count --;
                     return idx;
                 }
                 idx++;
@@ -401,10 +457,7 @@ struct Filesystem{
 
     }
 
-    unsigned int create_directory(unsigned int root,const std::string& dir_name){
 
-
-    }
 
 
 };
@@ -453,6 +506,7 @@ void getdir(std::string dir, uint32_t parent,Filesystem fs){
 int main(int argc,char *argv[]) {
     auto * img = load_image(argv[1]);
     auto fs = Filesystem(img);
-    getdir("test2",2,fs);
+    auto inode_num = fs.get_dir_inode(argv[2]);
+    getdir("lorems",inode_num,fs);
     return 0;
 }
