@@ -130,6 +130,9 @@ struct Filesystem{
     }
 
     uint32_t get_dir_inode(std::basic_string<char> path){
+        if(path == "/"){
+            return 2;
+        }
         if(path[0] == '/'){
             path.erase(path.begin());
         }
@@ -502,7 +505,8 @@ bool isDir(const std::string& dir,struct stat& fileInfo){
 }
 
 
-std::unordered_map<int,uint32_t > umap;
+std::unordered_map<uint32_t,uint32_t > umap;
+std::unordered_map<uint32_t,uint32_t > pmap;
 std::unordered_map<std::string,std::string> fmap;
 int incr = -1;
 void getdir(std::string dir, uint32_t parent,Filesystem& fs,
@@ -516,7 +520,7 @@ void getdir(std::string dir, uint32_t parent,Filesystem& fs,
     if(dir.at(dir.length()-1)!='/'){
         dir=dir+"/";
     }
-    if(dp!=nullptr){ //if the directory isn't empty
+    if(dp!=nullptr){
         entry=readdir(dp);
         while(entry){ //while there is something in the directory
             if(strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0){ //and if the entry isn't "." or ".."
@@ -529,8 +533,10 @@ void getdir(std::string dir, uint32_t parent,Filesystem& fs,
                         incr--;
                     queue.push(std::make_tuple(dir + entry->d_name,incr));
                     umap.insert(std::make_pair(incr,parent));
+                    pmap.insert(std::make_pair(incr,incr));
                     fmap.insert(std::make_pair(dir + entry->d_name,entry->d_name));
                     getdir(dir + entry->d_name,incr,fs,queue); //recurse
+
 
                 } else {
                     queue.push(std::make_tuple(dir + entry->d_name,parent));
@@ -545,7 +551,11 @@ void getdir(std::string dir, uint32_t parent,Filesystem& fs,
         (void) closedir(dp); //close directory
     }
     else{
-        perror ("Couldn't open the directory.");
+        //perror ("Couldn't open the directory.");
+        dir.pop_back();
+        queue.push(std::make_tuple(dir,parent));
+        fmap.insert(std::make_pair(dir,dir));
+
     }
 }
 template<typename T> void process_queue(T &q,Filesystem&fs) {
@@ -554,16 +564,22 @@ template<typename T> void process_queue(T &q,Filesystem&fs) {
         struct stat fileInfo{};
         FILE *file = fopen((std::get<0>(a)).c_str(),"r");
         if(isDir(std::get<0>(a),fileInfo)){
+
             auto inode = fs.write_file(fmap[std::get<0>(a)],fileInfo,nullptr,umap[std::get<1>(a)]);
             //std::cout << std::get<0>(a) << " " << inode << "\n";
-            umap[std::get<1>(a)] = inode;
+            pmap[std::get<1>(a)] = inode;
+            for(auto& m : umap){
+                if(m.second == std::get<1>(a)){
+                    m.second = inode;
+                }
+            }
         }else{
-            if(umap.find(std::get<1>(a)) != umap.end()){
-                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,umap[std::get<1>(a)]);
-                //std::cout << std::get<0>(a) << " " << umap[std::get<1>(a)] << "\n";
+            if(umap.find(pmap[std::get<1>(a)]) != umap.end()){
+                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,pmap[umap[std::get<1>(a)]]);
+                //std::cout << std::get<0>(a) << " " << umap[pmap[std::get<1>(a)]] << "\n";
             }else{
-                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,std::get<1>(a));
-                //std::cout << std::get<0>(a) << " " << std::get<1>(a) << "\n";
+                fs.write_file(fmap[std::get<0>(a)],fileInfo,file,pmap[std::get<1>(a)]);
+                //std::cout << std::get<0>(a) << " " << pmap[std::get<1>(a)] << "\n";
             }
 
         }
@@ -571,7 +587,7 @@ template<typename T> void process_queue(T &q,Filesystem&fs) {
 
         q.pop();
     }
-    std::cout << '\n';
+    //std::cout << '\n';
 }
 int main(int argc,char *argv[]) {
     uint32_t inode;
@@ -582,6 +598,7 @@ int main(int argc,char *argv[]) {
     }catch(const std::invalid_argument& ia){
         inode = fs.get_dir_inode(argv[3]);
     }
+    pmap.insert(std::make_pair(inode,inode));
     std::priority_queue <std::tuple<std::string,unsigned int>,std::vector<std::tuple<std::string,unsigned int>>,std::greater<>> q;
     getdir(argv[2],inode,fs,q);
     process_queue(q,fs);
