@@ -326,7 +326,7 @@ struct Filesystem{
                 std::cout << idx_free_inode << " ";
                 for(int idx=0; idx< blocks.size();idx++){
                     if(idx != blocks.size()-1){
-                        std::cout << blocks[idx] << " ";
+                        std::cout << blocks[idx] << ",";
                     }else{
                         std::cout << blocks[idx] << std::endl;
                     }
